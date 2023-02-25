@@ -28,6 +28,7 @@ import { CreateManyBankPaymentsDto } from './dto/create-many-bank-payments.dto'
 import { DonationBaseDto, ListDonationsDto } from './dto/list-donations.dto'
 import { donationWithPerson, DonationWithPerson } from './validators/donation.validator'
 import { CreateStripePaymentDto } from './dto/create-stripe-payment.dto'
+import { ImportStatus } from '../bank-transactions-file/dto/bank-transactions-import-status.dto'
 
 @Injectable()
 export class DonationsService {
@@ -313,6 +314,7 @@ export class DonationsService {
       items: data,
       total: count,
     }
+
     return result
   }
 
@@ -404,6 +406,7 @@ export class DonationsService {
       items: data,
       total: count,
     }
+
     return result
   }
 
@@ -492,6 +495,7 @@ export class DonationsService {
 
   /**
    * Create a payment intent for a donation
+   * https://stripe.com/docs/api/payment_intents/create
    * @param inputDto Payment intent create params
    * @returns {Promise<Stripe.Response<Stripe.PaymentIntent>>}
    */
@@ -507,6 +511,7 @@ export class DonationsService {
 
   /**
    * Update a payment intent for a donation
+   * https://stripe.com/docs/api/payment_intents/update
    * @param inputDto Payment intent create params
    * @returns {Promise<Stripe.Response<Stripe.PaymentIntent>>}
    */
@@ -515,6 +520,19 @@ export class DonationsService {
     inputDto: Stripe.PaymentIntentUpdateParams,
   ): Promise<Stripe.Response<Stripe.PaymentIntent>> {
     return this.stripeClient.paymentIntents.update(id, inputDto)
+  }
+
+  /**
+   * Cancel a payment intent for a donation
+   * https://stripe.com/docs/api/payment_intents/cancel
+   * @param inputDto Payment intent create params
+   * @returns {Promise<Stripe.Response<Stripe.PaymentIntent>>}
+   */
+  async cancelPaymentIntent(
+    id: string,
+    inputDto: Stripe.PaymentIntentCancelParams,
+  ): Promise<Stripe.Response<Stripe.PaymentIntent>> {
+    return this.stripeClient.paymentIntents.cancel(id, inputDto)
   }
 
   /**
@@ -529,29 +547,33 @@ export class DonationsService {
     return donation
   }
 
-  async createManyBankPayments(donationsDto: CreateManyBankPaymentsDto[]) {
-    for (const donation of donationsDto) {
-      await this.prisma.$transaction(async (tx) => {
-        //to avoid incrementing vault amount twice we first check if there is such donation
-        const existingDonation = await tx.donation.findUnique({
-          where: { extPaymentIntentId: donation.extPaymentIntentId },
+  async createUpdateBankPayment(donationsDto: CreateManyBankPaymentsDto): Promise<ImportStatus> {
+    return await this.prisma.$transaction(async (tx) => {
+      //to avoid incrementing vault amount twice we first check if there is such donation
+      const existingDonation = await tx.donation.findUnique({
+        where: { extPaymentIntentId: donationsDto.extPaymentIntentId },
+      })
+
+      if (!existingDonation) {
+        await tx.donation.create({
+          data: donationsDto,
         })
 
-        if (!existingDonation) {
-          await tx.donation.create({
-            data: donation,
-          })
+        await this.vaultService.incrementVaultAmount(
+          donationsDto.targetVaultId,
+          donationsDto.amount,
+          tx,
+        )
+        return ImportStatus.SUCCESS
+      }
 
-          await this.vaultService.incrementVaultAmount(donation.targetVaultId, donation.amount, tx)
-        } else {
-          //Donation exists, so updating with incoming donation without increasing vault amounts
-          await this.prisma.donation.update({
-            where: { extPaymentIntentId: donation.extPaymentIntentId },
-            data: donation,
-          })
-        }
+      //Donation exists, so updating with incoming donation without increasing vault amounts
+      await this.prisma.donation.update({
+        where: { extPaymentIntentId: donationsDto.extPaymentIntentId },
+        data: donationsDto,
       })
-    }
+      return ImportStatus.UPDATED
+    })
   }
 
   /**

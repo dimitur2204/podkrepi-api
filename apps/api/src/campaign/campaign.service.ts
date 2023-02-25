@@ -1,4 +1,5 @@
 import {
+  Prisma,
   Campaign,
   CampaignState,
   CampaignType,
@@ -20,11 +21,10 @@ import {
 import { PersonService } from '../person/person.service'
 import { PrismaService } from '../prisma/prisma.service'
 import { VaultService } from '../vault/vault.service'
+import { shouldAllowStatusChange } from '../donations/helpers/donation-status-updates'
+import { PaymentData } from '../donations/helpers/payment-intent-helpers'
 import { CreateCampaignDto } from './dto/create-campaign.dto'
 import { UpdateCampaignDto } from './dto/update-campaign.dto'
-import { PaymentData } from '../donations/helpers/payment-intent-helpers'
-import { getAllowedPreviousStatus } from '../donations/helpers/donation-status-updates'
-import { Prisma } from '@prisma/client'
 import { CampaignSummaryDto } from './dto/campaign-summary.dto'
 import {
   AdminCampaignListItem,
@@ -32,11 +32,13 @@ import {
   CampaignListItem,
   CampaignListItemSelect,
 } from './dto/list-campaigns.dto'
+import { NotificationService, donationNotificationSelect } from '../sockets/notifications/notification.service'
 
 @Injectable()
 export class CampaignService {
   constructor(
     private prisma: PrismaService,
+    private notificationService: NotificationService,
     @Inject(forwardRef(() => VaultService)) private vaultService: VaultService,
     @Inject(forwardRef(() => PersonService)) private personService: PersonService,
   ) {}
@@ -217,6 +219,8 @@ export class CampaignService {
         beneficiary: { select: { person: { select: { keycloakId: true } } } },
         coordinator: { select: { person: { select: { keycloakId: true } } } },
         organizer: { select: { person: { select: { keycloakId: true } } } },
+        state: true,
+        slug: true,
       },
     })
 
@@ -235,36 +239,56 @@ export class CampaignService {
   }
 
   async getCampaignBySlug(slug: string): Promise<Campaign> {
-    const campaign = await this.prisma.campaign.findFirst({
-      where: { slug },
-      include: {
-        campaignType: {
-          select: { name: true, slug: true, category: true },
-        },
-        beneficiary: {
-          select: {
-            id: true,
-            type: true,
-            publicData: true,
-            person: { select: { id: true, firstName: true, lastName: true } },
-            company: { select: { id: true, companyName: true } },
-          },
-        },
-        coordinator: {
-          select: {
-            id: true,
-            person: { select: { id: true, firstName: true, lastName: true, email: true } },
-          },
-        },
-        organizer: {
-          select: {
-            id: true,
-            person: { select: { id: true, firstName: true, lastName: true, email: true } },
-          },
-        },
-        campaignFiles: true,
+    const includeFilter = {
+      campaignType: {
+        select: { name: true, slug: true, category: true },
       },
+      beneficiary: {
+        select: {
+          id: true,
+          type: true,
+          publicData: true,
+          person: { select: { id: true, firstName: true, lastName: true } },
+          company: { select: { id: true, companyName: true } },
+        },
+      },
+      coordinator: {
+        select: {
+          id: true,
+          person: { select: { id: true, firstName: true, lastName: true, email: true } },
+        },
+      },
+      organizer: {
+        select: {
+          id: true,
+          person: { select: { id: true, firstName: true, lastName: true, email: true } },
+        },
+      },
+      campaignFiles: true,
+    }
+
+    let campaign = await this.prisma.campaign.findFirst({
+      where: { slug },
+      include: { ...includeFilter },
     })
+
+    // Check the Archive
+    if (!campaign) {
+      try {
+        const result = await this.prisma.slugArchive.findUnique({
+          where: {
+            slug,
+          },
+          select: {
+            campaign: { include: { ...includeFilter } },
+          },
+        })
+
+        campaign = result?.campaign || null
+      } catch {
+        // Continue on error
+      }
+    }
 
     if (campaign === null) {
       Logger.warn('No campaign record with slug: ' + slug)
@@ -283,15 +307,10 @@ export class CampaignService {
     return campaign
   }
 
-  async getCampaignByPaymentReference(paymentReference: string): Promise<Campaign> {
-    const campaign = await this.prisma.campaign.findFirst({
+  async getCampaignByPaymentReference(paymentReference: string): Promise<Campaign | null> {
+    return await this.prisma.campaign.findFirst({
       where: { paymentReference: paymentReference },
     })
-    if (!campaign) {
-      Logger.warn('No campaign record with Payment Reference: ' + paymentReference)
-      throw new NotFoundException('No campaign record with Payment Reference: ' + paymentReference)
-    }
-    return campaign
   }
 
   async listCampaignTypes(): Promise<CampaignType[]> {
@@ -417,7 +436,7 @@ export class CampaignService {
 
     let donation = await this.prisma.donation.findUnique({
       where: { extPaymentIntentId: paymentData.paymentIntentId },
-      select: { id: true, status: true },
+      select: donationNotificationSelect,
     })
 
     // check for UUID length of personId
@@ -432,11 +451,12 @@ export class CampaignService {
           chargedAmount: paymentData.chargedAmount,
           extPaymentMethodId: 'subscription',
         },
-        select: { id: true, status: true, extPaymentMethodId: true },
+        select: donationNotificationSelect,
       })
 
       if (donation) {
         donation.status = newDonationStatus
+        this.notificationService.sendNotification('successfulDonation', donation)
       }
 
       Logger.debug('Donation found by subscription: ', donation)
@@ -452,7 +472,7 @@ export class CampaignService {
       )
 
       try {
-        await this.prisma.donation.create({
+        const donation = await this.prisma.donation.create({
           data: {
             amount: paymentData.netAmount,
             chargedAmount: paymentData.chargedAmount,
@@ -468,7 +488,10 @@ export class CampaignService {
             billingEmail: paymentData.billingEmail,
             person: { connect: { id: paymentData.personId } },
           },
+          select: donationNotificationSelect,
         })
+
+        this.notificationService.sendNotification('successfulDonation', donation)
       } catch (error) {
         Logger.error(
           `Error while creating donation with paymentIntentId: ${paymentData.paymentIntentId} and status: ${newDonationStatus} . Error is: ${error}`,
@@ -479,12 +502,9 @@ export class CampaignService {
       return
     }
     //donation exists, so check if it is safe to update it
-    else if (
-      donation?.status === newDonationStatus ||
-      donation?.status === getAllowedPreviousStatus(newDonationStatus)
-    ) {
+    else if (shouldAllowStatusChange(donation.status, newDonationStatus)) {
       try {
-        await this.prisma.donation.update({
+        const updatedDonation = await this.prisma.donation.update({
           where: {
             id: donation.id,
           },
@@ -497,6 +517,12 @@ export class CampaignService {
             billingName: paymentData.billingName,
             billingEmail: paymentData.billingEmail,
           },
+          select: donationNotificationSelect,
+        })
+
+        this.notificationService.sendNotification('successfulDonation', {
+          ...updatedDonation,
+          person: donation.person,
         })
       } catch (error) {
         Logger.error(
@@ -592,12 +618,39 @@ export class CampaignService {
     }
   }
 
-  async update(id: string, updateCampaignDto: UpdateCampaignDto): Promise<Campaign | null> {
+  async update(
+    id: string,
+    updateCampaignDto: UpdateCampaignDto,
+    campaign: Partial<Campaign> | null,
+  ): Promise<Campaign | null> {
     const result = await this.prisma.campaign.update({
       where: { id: id },
       data: updateCampaignDto,
     })
+
     if (!result) throw new NotFoundException(`Not found campaign with id: ${id}`)
+
+    // Make old slug redirect to this campaign
+    if (
+      campaign?.state === CampaignState.active &&
+      result?.state === CampaignState.active &&
+      campaign?.slug &&
+      updateCampaignDto.slug !== campaign.slug
+    ) {
+      await this.prisma.slugArchive.upsert({
+        where: {
+          slug: campaign.slug,
+        },
+        update: {
+          campaignId: id,
+        },
+        create: {
+          slug: campaign.slug,
+          campaignId: id,
+        },
+      })
+    }
+
     return result
   }
 
